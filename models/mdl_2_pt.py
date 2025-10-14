@@ -76,44 +76,29 @@ class GLU(nn.Module):
         return outputs * gate.sigmoid()
 
 class FeedForwardModule(nn.Module):
-    """
-    Feed Forward Module follow pre-norm residual units and apply layer normalization within the residual unit
-    and on the input before the first linear layer. This module also apply Swish activation and dropout, which helps
-    regularizing the network.
+   
+    def __init__(self, dim=512, expansion=4, dropout=0.1, use_glu=False):
+        super().__init__()
+        hidden = dim * expansion
+        self.use_glu = use_glu
+        if use_glu:
+            self.fc1 = tf.keras.layers.Dense(hidden * 2)
+        else:
+            self.fc1 = tf.keras.layers.Dense(hidden)
+        self.act = tf.keras.activations.swish
+        self.fc2 = tf.keras.layers.Dense(dim)
+        self.dropout = tf.keras.layers.Dropout(dropout)
 
-    Args:
-        encoder_dim (int): Dimension of squeezeformer encoder
-        expansion_factor (int): Expansion factor of feed forward module.
-        dropout_p (float): Ratio of dropout
-    Inputs: inputs
-        - **inputs** (batch, time, dim): Tensor contains input sequences
-    Outputs: outputs
-        - **outputs** (batch, time, dim): Tensor produces by feed forward module.
-    """
-
-    def __init__(
-        self,
-        encoder_dim: int = 512,
-        expansion_factor: int = 4,
-        dropout_p: float = 0.1,
-    ) -> None:
-        super(FeedForwardModule, self).__init__()
-        
-        self.ffn1 = nn.Linear(encoder_dim, encoder_dim * expansion_factor, bias=True)
-        self.act = Swish()
-        self.do1 = nn.Dropout(p=dropout_p)
-        self.ffn2 = nn.Linear(encoder_dim * expansion_factor, encoder_dim, bias=True)
-        self.do2 = nn.Dropout(p=dropout_p)
-
-    def forward(self, x):
-        x = self.ffn1(x)
-        x = self.act(x)
-        x = self.do1(x)
-        x = self.ffn2(x)
-        x = self.do2(x)
-        
+    def call(self, x, training=False):
+        if self.use_glu:
+            x1, gate = tf.split(self.fc1(x), num_or_size_splits=2, axis=-1)
+            x = x1 * tf.nn.sigmoid(gate)
+        else:
+            x = self.act(self.fc1(x))
+        x = self.dropout(x, training=training)
+        x = self.fc2(x)
+        x = self.dropout(x, training=training)
         return x
-
 
 class RelPositionalEncoding(nn.Module):
     """
