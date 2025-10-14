@@ -404,9 +404,17 @@ class SqueezeformerBlock(nn.Module):
         '''       
         
         
-        self.mhsa_llama = LlamaAttention(LlamaConfig(hidden_size = encoder_dim, 
-                                       num_attention_heads = num_attention_heads, 
-                                       max_position_embeddings = 384))
+       self.mhsa_masa = WindowDecomposedMaSA1D(
+    dim=encoder_dim,
+    num_heads=num_attention_heads,
+    window_size=64,          # tune: 32/64/128 based on seq lengths
+    gammas=torch.linspace(0.85, 0.95, steps=num_attention_heads),  # per-head decay
+    qkv_bias=True,
+    attn_drop=attention_dropout_p,
+    proj_drop=attention_dropout_p,
+    use_lce=True,
+    lce_kernel=5,
+)
         self.ln_mhsa = nn.LayerNorm(encoder_dim)
         
         self.ff_mhsa = FeedForwardModule(
@@ -447,31 +455,37 @@ class SqueezeformerBlock(nn.Module):
         '''
 
     def forward(self, x, cos, sin, mask):
-        mask_pad = ( mask).long().bool().unsqueeze(1)
-        mask_pad = ~( mask_pad.permute(0, 2,1) * mask_pad)
+        # --- inside SqueezeformerBlock.forward ---
+        # inputs: x (B, T, C), cos, sin, mask (B, T)
+        mask_pad = (mask).long().bool().unsqueeze(1)                 # (B, 1, T)
+        mask_pad = ~(mask_pad.permute(0, 2, 1) * mask_pad)           # (B, T, T) for Llama (kept for compatibility)
         mask_flat = mask.view(-1).bool()
         bs, slen, nfeats = x.shape
         
         residual = x
         x = x * self.scale_mhsa.to(x.dtype) + self.bias_mhsa.to(x.dtype)
-        x = residual + self.mhsa_llama(x, cos, sin, attention_mask = mask_pad.unsqueeze(1) )[0]
-        # Skip pad #1
+        
+        # old LlamaAttention call:
+        # x = residual + self.mhsa_llama(x, cos, sin, attention_mask = mask_pad.unsqueeze(1) )[0]
+        
+        # new MaSA call (uses 1D mask only):
+        x = residual + self.mhsa_masa(x, attention_mask=mask.bool())  # (B, T, C)
+        
+        # Skip pad #1 (unchanged)
         x_skip = x.view(-1, x.shape[-1])
         x = x_skip[mask_flat].unsqueeze(0)
-        x = self.ln_mhsa(x) #casts to fp32
+        x = self.ln_mhsa(x)
         residual = x
-        #32
         x = x * self.scale_ff_mhsa.to(x.dtype) + self.bias_ff_mhsa.to(x.dtype)
-        #32
-        x = residual + self.ff_mhsa(x) 
-        #32
-        x = self.ln_ff_mhsa(x) #casts to fp32
+        x = residual + self.ff_mhsa(x)
+        x = self.ln_ff_mhsa(x)
         
-        
-        # Unskip pad #1
-#         print(x_skip[mask_flat].dtype, x[0].dtype)
+        # Unskip pad #1 (unchanged)
         x_skip[mask_flat] = x[0].to(x_skip.dtype)
         x = x_skip.view(bs, slen, nfeats)
+        
+        # rest of block (conv + FF) unchanged ...
+
         residual = x
         # torch.Size([16, 384, 128])
         x = x * self.scale_conv.to(x.dtype) + self.bias_conv.to(x.dtype)
@@ -614,104 +628,157 @@ class FeatureExtractor(nn.Module):
         return x
 
 
-class LlamaAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: LlamaConfig):
+class LCE1D(nn.Module):
+    """Depthwise + pointwise 1D conv on channels-last sequences via Conv1d."""
+    def __init__(self, channels: int, kernel_size: int = 5):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        pad = kernel_size // 2
+        self.dw = nn.Conv1d(channels, channels, kernel_size, padding=pad, groups=channels)
+        self.pw = nn.Conv1d(channels, channels, 1)
+        self.act = nn.GELU()
+        nn.init.kaiming_normal_(self.dw.weight, a=math.sqrt(5))
+        nn.init.kaiming_normal_(self.pw.weight, a=math.sqrt(5))
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
-        #self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+    def forward(self, x_bt_c: torch.Tensor):  # (B, T, C)
+        x = x_bt_c.transpose(1, 2)           # (B, C, T)
+        x = self.pw(self.act(self.dw(x)))
+        return x.transpose(1, 2)             # (B, T, C)
 
-    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
-        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+def _seq_window_partition(x: torch.Tensor, ws: int) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """Partition (B, T, C) into non-overlapping windows -> (B*nw, ws, C), with right padding."""
+    B, T, C = x.shape
+    pad_t = (ws - T % ws) % ws
+    if pad_t > 0:
+        x = F.pad(x, (0, 0, 0, pad_t))  # pad along T
+    nw = (T + pad_t) // ws
+    xw = x.view(B, nw, ws, C).reshape(B * nw, ws, C)
+    return xw, (T, pad_t)
 
-    def forward(
+def _seq_window_reverse(xw: torch.Tensor, ws: int, B: int, T: int, pad_t: int) -> torch.Tensor:
+    """Reverse windows (B*nw, ws, C) to (B, T, C), cropping right padding."""
+    C = xw.shape[-1]
+    nw = xw.shape[0] // B
+    x = xw.view(B, nw, ws, C).reshape(B, nw * ws, C)
+    if pad_t > 0:
+        x = x[:, :T, :]
+    return x
+
+def _make_1d_distance(ws: int, device: torch.device) -> torch.Tensor:
+    idx = torch.arange(ws, device=device)
+    return torch.abs(idx[:, None] - idx[None, :]).float()
+
+class WindowDecomposedMaSA1D(nn.Module):
+    """
+    1D Windowed Decomposed Manhattan Self-Attention for sequences (B, T, C).
+    - Per-head decay gamma^{|i-j|} inside each window.
+    - Softmax over masked logits.
+    - Optional LCE1D on V as residual: out += LCE(V).
+    """
+    def __init__(
         self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-        
-        
+        dim: int,
+        num_heads: int = 8,
+        window_size: int = 64,
+        gammas: Union[float, int, torch.Tensor] = 0.9,
+        qkv_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        use_lce: bool = True,
+        lce_kernel: int = 5,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.window_size = window_size
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if isinstance(gammas, (float, int)):
+            g = torch.tensor([float(gammas)] * num_heads, dtype=torch.float32)
+        else:
+            g = torch.as_tensor(gammas, dtype=torch.float32)
+            assert g.shape[0] == num_heads
+        self.register_buffer("gammas", g)
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
-        '''
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        '''
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos[:, :, :kv_seq_len], sin[:, :, :kv_seq_len])
-        # [bsz, nh, t, hd]
+        self.qkv = nn.Linear(dim, 3 * dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        if past_key_value is not None:
-            # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        # distance buffer (created lazily per-device/size at forward)
+        self.register_buffer("dist_ws", torch.empty(0), persistent=False)
 
-        past_key_value = (key_states, value_states) if use_cache else None
+        self.use_lce = use_lce
+        if use_lce:
+            self.lce = LCE1D(dim, kernel_size=lce_kernel)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+    def _get_dist(self, ws: int, device: torch.device):
+        if (self.dist_ws.numel() == 0) or (self.dist_ws.shape[0] != ws) or (self.dist_ws.device != device):
+            self.dist_ws = _make_1d_distance(ws, device)
+        return self.dist_ws
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (B, T, C)
+        attention_mask: (B, T) bool, True for valid tokens, False for pad
+        """
+        B, T, C = x.shape
+        ws = self.window_size
+        device = x.device
 
+        xw, (T_orig, pad_t) = _seq_window_partition(x, ws)  # (B*nw, ws, C)
+        Bnw = xw.shape[0]
+
+        qkv = self.qkv(xw)  # (Bnw, ws, 3C)
+        qkv = qkv.view(Bnw, ws, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]  # (Bnw, heads, ws, hd)
+
+        dist = self._get_dist(ws, device)             # (ws, ws)
+        gammas = self.gammas.to(device).view(1, self.num_heads, 1, 1)  # (1, heads, 1, 1)
+        DW = gammas ** dist                            # (1, heads, ws, ws)
+        # expand to (Bnw, heads, ws, ws)
+        DW = DW.expand(Bnw, self.num_heads, ws, ws)
+
+        # logits
+        attn_logits = torch.matmul(q, k.transpose(-2, -1))  # (Bnw, heads, ws, ws)
+        attn_logits = attn_logits * DW
+
+        # build per-window key mask (mask keys where padded)
         if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights.masked_fill_(attention_mask, torch.finfo(attn_weights.dtype).min)
+            mask = attention_mask
+            if pad_t > 0:
+                mask = F.pad(mask, (0, pad_t), value=False)
+            nw = mask.shape[1] // ws
+            mk = mask.view(B, nw, ws).reshape(Bnw, ws)                    # (Bnw, ws)
+            # expand to (Bnw, heads, ws, ws) to mask keys
+            mk_keys = (~mk).unsqueeze(1).unsqueeze(2).expand(Bnw, self.num_heads, ws, ws)
+            attn_logits = attn_logits.masked_fill(mk_keys, torch.finfo(attn_logits.dtype).min)
+
+        attn = F.softmax(attn_logits, dim=-1)
+        attn = self.attn_drop(attn)
+        out = torch.matmul(attn, v)  # (Bnw, heads, ws, hd)
+
+        out = out.transpose(1, 2).contiguous().view(Bnw, ws, C)  # merge heads
+
+        # LCE on V (original), residual add
+        if self.use_lce:
+            v_merge = v.transpose(1, 2).contiguous().view(Bnw, ws, C)  # (Bnw, ws, C)
+            out = out + self.lce(v_merge)
+
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        # zero out padded query positions (optional safety)
+        if attention_mask is not None:
+            mq = mask.view(B, nw, ws).reshape(Bnw, ws)  # (Bnw, ws)
+            out = out * mq.unsqueeze(-1).to(out.dtype)
+
+        y = _seq_window_reverse(out, ws, B, T_orig, pad_t)  # (B, T, C)
+        return y
 
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
