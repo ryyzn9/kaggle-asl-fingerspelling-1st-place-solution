@@ -28,17 +28,22 @@ class Decoder(nn.Module):
         self.decoder_pad_token_id = decoder_config.pad_token_id #used for early stopping
         self.decoder_end_token_id= decoder_config.eos_token_id
         
-    def forward(self,x, labels=None, attention_mask = None, encoder_attention_mask = None):
-        
-        if labels is not None:
-            decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
-            
-        decoder_outputs = self.decoder(input_ids=decoder_input_ids,
-                                       encoder_hidden_states=x, 
-                                       attention_mask = attention_mask,
-                                       encoder_attention_mask = encoder_attention_mask)
-        lm_logits = self.lm_head(decoder_outputs.last_hidden_state)
-        return lm_logits
+    def forward(self, x, labels=None, attention_mask=None, encoder_attention_mask=None):
+    if labels is not None:
+        decoder_input_ids = shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
+    else:
+        # Greedy single-step prime; for full inference use .generate()
+        decoder_input_ids = torch.full(
+            (x.size(0), 1), self.decoder_start_token_id, dtype=torch.long, device=x.device
+        )
+    decoder_outputs = self.decoder(
+        input_ids=decoder_input_ids,
+        encoder_hidden_states=x,
+        attention_mask=attention_mask,
+        encoder_attention_mask=encoder_attention_mask,
+    )
+    lm_logits = self.lm_head(decoder_outputs.last_hidden_state)
+    return lm_logits
             
     def generate(self, x, max_new_tokens=33, encoder_attention_mask=None):
 
@@ -76,28 +81,25 @@ class GLU(nn.Module):
         return outputs * gate.sigmoid()
 
 class FeedForwardModule(nn.Module):
-   
-    def __init__(self, dim=512, expansion=4, dropout=0.1, use_glu=False):
+    def __init__(self, encoder_dim=512, expansion_factor=4, dropout_p=0.1, use_glu=False):
         super().__init__()
-        hidden = dim * expansion
+        hidden = encoder_dim * expansion_factor
+        in_features = hidden * 2 if use_glu else hidden
         self.use_glu = use_glu
-        if use_glu:
-            self.fc1 = tf.keras.layers.Dense(hidden * 2)
-        else:
-            self.fc1 = tf.keras.layers.Dense(hidden)
-        self.act = tf.keras.activations.swish
-        self.fc2 = tf.keras.layers.Dense(dim)
-        self.dropout = tf.keras.layers.Dropout(dropout)
+        self.fc1 = nn.Linear(encoder_dim, in_features)
+        self.act = nn.SiLU()
+        self.fc2 = nn.Linear(hidden if use_glu else hidden, encoder_dim)  # same hidden either way
+        self.dropout = nn.Dropout(dropout_p)
 
-    def call(self, x, training=False):
+    def forward(self, x):
         if self.use_glu:
-            x1, gate = tf.split(self.fc1(x), num_or_size_splits=2, axis=-1)
-            x = x1 * tf.nn.sigmoid(gate)
+            x1, gate = self.fc1(x).chunk(2, dim=-1)
+            x = x1 * torch.sigmoid(gate)
         else:
             x = self.act(self.fc1(x))
-        x = self.dropout(x, training=training)
+        x = self.dropout(x)
         x = self.fc2(x)
-        x = self.dropout(x, training=training)
+        x = self.dropout(x)
         return x
 
 class RelPositionalEncoding(nn.Module):
